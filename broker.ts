@@ -19,6 +19,7 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  AckMessagesRequest,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -58,15 +59,37 @@ db.run(`
   )
 `);
 
+// Cross-platform process alive check (process.kill(pid, 0) is unreliable on Windows)
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: unknown) {
+    const err = e as { code?: string };
+    // EPERM = exists but we can't signal it — it's alive
+    if (err?.code === "EPERM") return true;
+    // On Windows, process.kill(pid, 0) is unreliable — fall back to tasklist
+    if (process.platform === "win32") {
+      try {
+        const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const output = new TextDecoder().decode(result.stdout);
+        return output.includes(String(pid));
+      } catch {
+        return true; // If tasklist fails, assume alive to avoid false cleanup
+      }
+    }
+    return false;
+  }
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    if (!isProcessAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -209,14 +232,17 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  // Two-phase delivery: return messages but do NOT mark delivered.
+  // Recipient must call /ack-messages after confirming receipt.
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
-
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): void {
+  // Phase 2: mark messages as delivered after recipient confirms receipt
+  for (const id of body.message_ids) {
+    markDelivered.run(id);
+  }
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -257,6 +283,9 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          handleAckMessages(body as AckMessagesRequest);
+          return Response.json({ ok: true });
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
