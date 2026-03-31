@@ -35,6 +35,7 @@ import {
 } from "./shared/summarize.ts";
 import { TOKEN_PATH, readTokenSync } from "./shared/token.ts";
 import { loadConfig } from "./shared/config.ts";
+import { fileURLToPath } from "url";
 
 // --- Configuration ---
 
@@ -42,7 +43,7 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 
 // --- Auth token (loaded after broker is up) ---
 
@@ -142,7 +143,7 @@ async function ensureBroker(): Promise<void> {
 
 // --- Utility ---
 
-const CPM_LOG_DIR = new URL("../cpm-logs", import.meta.url).pathname;
+const CPM_LOG_DIR = fileURLToPath(new URL("../cpm-logs", import.meta.url));
 const MSG_LOG_PATH = `${CPM_LOG_DIR}/messages.log`;
 const SERVER_LOG_PATH = `${CPM_LOG_DIR}/server.log`;
 
@@ -196,6 +197,10 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Track message IDs already pushed via channel to avoid re-pushing every poll cycle.
+// Messages are NOT acked by the poll loop — only check_messages acks them —
+// so they remain available as a fallback when channels aren't active.
+const pushedMessageIds = new Set<number>();
 
 // --- MCP Server ---
 
@@ -541,11 +546,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        // check_messages is the ONLY ack path. The background poller pushes channel
+        // notifications but never acks — so messages stay undelivered until this tool
+        // is called. This guarantees check_messages always finds pending messages,
+        // even when channel push silently fails (mcp.notification never throws).
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
         if (result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
+        }
+        // Ack messages so they aren't returned again
+        const messageIds = result.messages.map((m) => m.id);
+        try {
+          await brokerFetch("/ack-messages", { id: myId, message_ids: messageIds });
+        } catch {
+          // Non-critical — messages will show up again on next check
+        }
+        // Also mark as pushed so the poll loop doesn't re-push them
+        for (const id of messageIds) {
+          pushedMessageIds.add(id);
         }
         const lines = result.messages.map((m) => {
           let prefix = "";
@@ -564,7 +584,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${result.messages.length} message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -648,11 +668,10 @@ async function pollAndPushMessages() {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
     if (result.messages.length === 0) return;
 
-    // Two-phase delivery: push notifications first, then ack to broker
-    const ackedIds: number[] = [];
-
     for (const msg of result.messages) {
-      // Look up the sender's info for context
+      // Skip messages already pushed in this session
+      if (pushedMessageIds.has(msg.id)) continue;
+
       let fromSummary = "";
       let fromCwd = "";
       let fromName = "";
@@ -673,9 +692,9 @@ async function pollAndPushMessages() {
       }
 
       // Push as channel notification — this is what makes it immediate.
+      // Don't ack here: if channels aren't active the push silently fails,
+      // and check_messages must still be able to retrieve these messages.
       // IMPORTANT: Claude Code silently drops notifications with null meta values.
-      // Use conditional spread to OMIT optional fields rather than passing null.
-      // Also message_id is required for Claude Code to render the notification.
       await mcp.notification({
         method: "notifications/claude/channel",
         params: {
@@ -694,41 +713,27 @@ async function pollAndPushMessages() {
         },
       });
 
-      // Notification succeeded — mark for ack
-      ackedIds.push(msg.id);
+      pushedMessageIds.add(msg.id);
 
-      // Full message log for observability (stderr + file)
+      // Observability logging
       const senderLabel = fromName || msg.from_id;
       const timestamp = new Date().toLocaleTimeString();
       const typeTag = msg.type && msg.type !== "text" ? `[${msg.type.toUpperCase()}] ` : "";
-      // Build bullet summary: first 3 lines, truncated
       const lines = msg.text.split("\n").filter((l: string) => l.trim());
       const bullets = lines.slice(0, 3).map((l: string) => `  • ${l.slice(0, 100)}${l.length > 100 ? "..." : ""}`).join("\n");
       const summaryLine = lines.length > 3 ? `\n  (${lines.length - 3} more lines)` : "";
       const logEntry = `[${timestamp}] ${typeTag}From ${senderLabel} (${msg.from_id}):\n${bullets}${summaryLine}\n\nFull message:\n${msg.text}`;
       log(`--- MESSAGE RECEIVED ---\n[${timestamp}] ${typeTag}From ${senderLabel} (${msg.from_id}):\n${bullets}${summaryLine}\n--- END MESSAGE ---`);
 
-      // Append to persistent message log for tail -f monitoring
       try {
-        const logPath = `${process.env.HOME}/.claude-peers-messages.log`;
+        const logPath = `${process.env.HOME ?? require("os").homedir()}/.claude-peers-messages.log`;
         const entry = `\n${"=".repeat(60)}\n${logEntry}\n`;
         await Bun.write(Bun.file(logPath), entry, { append: true });
       } catch {
         // Non-critical — file logging is best-effort
       }
     }
-
-    // Phase 2: Ack delivered messages — only after successful notification push
-    if (ackedIds.length > 0) {
-      try {
-        await brokerFetch("/ack-messages", { id: myId, message_ids: ackedIds });
-      } catch (e) {
-        // Ack failed — messages stay undelivered, will retry on next poll (at-least-once)
-        log(`Ack failed, will retry next poll: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
   }
 }

@@ -4,9 +4,10 @@
  * Used by server.ts and cli.ts to read the broker auth token.
  */
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 
 export const TOKEN_PATH =
-  process.env.CLAUDE_PEERS_TOKEN ?? `${process.env.HOME}/.claude-peers-token`;
+  process.env.CLAUDE_PEERS_TOKEN ?? `${process.env.HOME ?? homedir()}/.claude-peers-token`;
 
 /**
  * Read the auth token from the token file.

@@ -3,11 +3,12 @@
 
 import { $ } from "bun";
 import { existsSync, chmodSync } from "node:fs";
-import { hostname } from "node:os";
+import { hostname, homedir } from "node:os";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-const DEFAULT_CERT_PATH = `${process.env.HOME}/.claude-peers-federation.crt`;
-const DEFAULT_KEY_PATH = `${process.env.HOME}/.claude-peers-federation.key`;
+const HOME = process.env.HOME ?? homedir();
+const DEFAULT_CERT_PATH = `${HOME}/.claude-peers-federation.crt`;
+const DEFAULT_KEY_PATH = `${HOME}/.claude-peers-federation.key`;
 
 export function federationLog(msg: string): void {
   const line = `[CPM-federation] ${msg}`;

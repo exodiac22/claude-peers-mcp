@@ -47,11 +47,14 @@ import {
   federationFetch,
 } from "./federation.ts";
 import { loadConfig } from "./shared/config.ts";
+import { fileURLToPath } from "url";
+import { homedir } from "os";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
-const LOG_DIR = new URL("../cpm-logs", import.meta.url).pathname;
-const TOKEN_PATH = process.env.CLAUDE_PEERS_TOKEN ?? `${process.env.HOME}/.claude-peers-token`;
+const HOME = process.env.HOME ?? homedir();
+const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${HOME}/.claude-peers.db`;
+const LOG_DIR = fileURLToPath(new URL("../cpm-logs", import.meta.url));
+const TOKEN_PATH = process.env.CLAUDE_PEERS_TOKEN ?? `${HOME}/.claude-peers-token`;
 
 // --- Persistent config file (env vars override config file values) ---
 const persistentConfig = loadConfig();
@@ -174,6 +177,7 @@ db.run(`
 try { db.run("ALTER TABLE messages ADD COLUMN type TEXT NOT NULL DEFAULT 'text'"); } catch { /* column already exists */ }
 try { db.run("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL"); } catch { /* column already exists */ }
 try { db.run("ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL"); } catch { /* column already exists */ }
+try { db.run("ALTER TABLE messages ADD COLUMN delivered_at TEXT DEFAULT NULL"); } catch { /* column already exists */ }
 
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
@@ -244,7 +248,7 @@ const selectMessageExists = db.prepare(`
 `);
 
 const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
+  UPDATE messages SET delivered = 1, delivered_at = datetime('now') WHERE id = ?
 `);
 
 const deleteDeliveredMessages = db.prepare(`
@@ -549,6 +553,7 @@ function handleAckMessages(body: AckMessagesRequest): void {
     markDelivered.run(mid);
   }
 }
+
 
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
