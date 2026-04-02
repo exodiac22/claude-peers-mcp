@@ -1108,3 +1108,147 @@ describe("peer eviction on re-register", () => {
     expect(sendRes.status).toBeGreaterThanOrEqual(400);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Auto-naming & display_name
+// ---------------------------------------------------------------------------
+
+describe("Auto-naming", () => {
+  test("first peer gets display_name matching Agent N pattern", async () => {
+    const res = await post("/register", {
+      pid: brokerProc.pid, cwd: "/tmp/autoname-1", git_root: null, tty: "/dev/pts/301", session_name: "", summary: "",
+    });
+    const data = (await res.json()) as { id: string; display_name: string };
+    expect(data.display_name).toMatch(/^Agent \d+$/);
+    await post("/unregister", { id: data.id });
+  });
+
+  test("sequential peers get incrementing Agent numbers", async () => {
+    const ids: string[] = [];
+    const numbers: number[] = [];
+
+    for (let i = 0; i < 3; i++) {
+      const res = await post("/register", {
+        pid: brokerProc.pid, cwd: `/tmp/autoname-seq-${i}`, git_root: null, tty: `/dev/pts/31${i}`, session_name: "", summary: "",
+      });
+      const data = (await res.json()) as { id: string; display_name: string };
+      ids.push(data.id);
+      const match = data.display_name.match(/^Agent (\d+)$/);
+      expect(match).toBeTruthy();
+      numbers.push(parseInt(match![1], 10));
+    }
+
+    // Numbers should be strictly increasing
+    expect(numbers[1]).toBeGreaterThan(numbers[0]);
+    expect(numbers[2]).toBeGreaterThan(numbers[1]);
+
+    for (const id of ids) await post("/unregister", { id });
+  });
+
+  test("gap-filling: re-uses lowest available Agent number", async () => {
+    // Register two peers
+    const res1 = await post("/register", {
+      pid: brokerProc.pid, cwd: "/tmp/gap-1", git_root: null, tty: "/dev/pts/321", session_name: "", summary: "",
+    });
+    const d1 = (await res1.json()) as { id: string; display_name: string };
+
+    const res2 = await post("/register", {
+      pid: process.pid, cwd: "/tmp/gap-2", git_root: null, tty: "/dev/pts/322", session_name: "", summary: "",
+    });
+    const d2 = (await res2.json()) as { id: string; display_name: string };
+
+    const num1 = parseInt(d1.display_name.match(/Agent (\d+)/)![1], 10);
+
+    // Unregister the first peer, creating a gap
+    await post("/unregister", { id: d1.id });
+
+    // Register a third peer — should fill the gap
+    const res3 = await post("/register", {
+      pid: brokerProc.pid, cwd: "/tmp/gap-3", git_root: null, tty: "/dev/pts/323", session_name: "", summary: "",
+    });
+    const d3 = (await res3.json()) as { id: string; display_name: string };
+    const num3 = parseInt(d3.display_name.match(/Agent (\d+)/)![1], 10);
+
+    expect(num3).toBeLessThanOrEqual(num1);
+
+    await post("/unregister", { id: d2.id });
+    await post("/unregister", { id: d3.id });
+  });
+
+  test("display_name persists after set_name (immutable)", async () => {
+    const res = await post("/register", {
+      pid: brokerProc.pid, cwd: "/tmp/immutable", git_root: null, tty: "/dev/pts/331", session_name: "", summary: "",
+    });
+    const data = (await res.json()) as { id: string; display_name: string };
+    const originalDisplayName = data.display_name;
+
+    // Override session_name
+    await post("/set-name", { id: data.id, session_name: "CustomName" });
+
+    // Fetch peer — display_name should be unchanged
+    const peerRes = await post("/get-peer", { id: data.id });
+    const { peer } = (await peerRes.json()) as { peer: { display_name: string; session_name: string } };
+    expect(peer.display_name).toBe(originalDisplayName);
+    expect(peer.session_name).toBe("CustomName");
+
+    await post("/unregister", { id: data.id });
+  });
+
+  test("display_name inherited on TTY eviction", async () => {
+    const tty = "/dev/pts/341";
+    const res1 = await post("/register", {
+      pid: brokerProc.pid, cwd: "/tmp/evict", git_root: null, tty, session_name: "", summary: "",
+    });
+    const d1 = (await res1.json()) as { id: string; display_name: string };
+
+    // Re-register on same TTY with different PID — evicts the first
+    const res2 = await post("/register", {
+      pid: process.pid, cwd: "/tmp/evict", git_root: null, tty, session_name: "", summary: "",
+    });
+    const d2 = (await res2.json()) as { id: string; display_name: string };
+
+    expect(d2.display_name).toBe(d1.display_name);
+
+    await post("/unregister", { id: d2.id });
+  });
+
+  test("explicit session_name and auto display_name stored independently", async () => {
+    const res = await post("/register", {
+      pid: brokerProc.pid, cwd: "/tmp/both", git_root: null, tty: "/dev/pts/351", session_name: "MyCustomName", summary: "",
+    });
+    const data = (await res.json()) as { id: string; display_name: string };
+    expect(data.display_name).toMatch(/^Agent \d+$/);
+
+    const peerRes = await post("/get-peer", { id: data.id });
+    const { peer } = (await peerRes.json()) as { peer: { display_name: string; session_name: string } };
+    expect(peer.session_name).toBe("MyCustomName");
+    expect(peer.display_name).toMatch(/^Agent \d+$/);
+
+    await post("/unregister", { id: data.id });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Get Peer endpoint
+// ---------------------------------------------------------------------------
+
+describe("Get Peer", () => {
+  test("/get-peer returns peer by ID including display_name", async () => {
+    const id = await registerPeer({ tty: "/dev/pts/401" });
+    const res = await post("/get-peer", { id });
+    const { peer } = (await res.json()) as { peer: { id: string; display_name: string; session_name: string; cwd: string } };
+
+    expect(peer).toBeTruthy();
+    expect(peer.id).toBe(id);
+    expect(peer.cwd).toBe("/tmp/test-cwd");
+    expect(typeof peer.display_name).toBe("string");
+
+    await post("/unregister", { id });
+  });
+
+  test("/get-peer with unknown ID returns null peer", async () => {
+    const res = await post("/get-peer", { id: "nonexistent_id_12345" });
+    const { peer } = (await res.json()) as { peer: null };
+    expect(peer).toBeNull();
+  });
+});

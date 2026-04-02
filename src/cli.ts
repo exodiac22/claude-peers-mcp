@@ -498,6 +498,7 @@ if (Bun.main === import.meta.path) {
               git_root: string | null;
               tty: string | null;
               session_name: string;
+              display_name: string;
               summary: string;
               last_seen: string;
             }>
@@ -509,8 +510,10 @@ if (Bun.main === import.meta.path) {
 
           console.log("\nPeers:");
           for (const p of peers) {
-            const nameTag = p.session_name ? ` [${p.session_name}]` : "";
-            console.log(`  ${p.id}${nameTag}  PID:${p.pid}  ${p.cwd}`);
+            const label = p.session_name || p.display_name || p.id;
+            const idSuffix = (p.session_name || p.display_name) ? ` [${p.id}]` : "";
+            const autoTag = (p.display_name && p.display_name !== p.session_name && p.session_name) ? ` (${p.display_name})` : "";
+            console.log(`  ${label}${autoTag}${idSuffix}  PID:${p.pid}  ${p.cwd}`);
             if (p.summary) console.log(`         ${p.summary}`);
             if (p.tty) console.log(`         TTY: ${p.tty}`);
             console.log(`         Last seen: ${p.last_seen}`);
@@ -532,6 +535,7 @@ if (Bun.main === import.meta.path) {
             git_root: string | null;
             tty: string | null;
             session_name: string;
+            display_name: string;
             summary: string;
             last_seen: string;
           }>
@@ -545,8 +549,10 @@ if (Bun.main === import.meta.path) {
           console.log("No peers registered.");
         } else {
           for (const p of peers) {
-            const nameTag = p.session_name ? ` [${p.session_name}]` : "";
-            const parts = [`${p.id}${nameTag}  PID:${p.pid}  ${p.cwd}`];
+            const label = p.session_name || p.display_name || p.id;
+            const idSuffix = (p.session_name || p.display_name) ? ` [${p.id}]` : "";
+            const autoTag = (p.display_name && p.display_name !== p.session_name && p.session_name) ? ` (${p.display_name})` : "";
+            const parts = [`${label}${autoTag}${idSuffix}  PID:${p.pid}  ${p.cwd}`];
             if (p.summary) parts.push(`  Summary: ${p.summary}`);
             console.log(parts.join("\n"));
           }

@@ -18,6 +18,8 @@ import type {
   HeartbeatRequest,
   SetSummaryRequest,
   SetNameRequest,
+  GetPeerRequest,
+  GetPeerResponse,
   ListPeersRequest,
   SendMessageRequest,
   PollMessagesRequest,
@@ -154,8 +156,9 @@ db.run(`
   )
 `);
 
-// Schema migration: add session_name column for existing databases
+// Schema migrations: add columns for existing databases
 try { db.run("ALTER TABLE peers ADD COLUMN session_name TEXT DEFAULT ''"); } catch { /* column already exists */ }
+try { db.run("ALTER TABLE peers ADD COLUMN display_name TEXT DEFAULT ''"); } catch { /* column already exists */ }
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -224,8 +227,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, session_name, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, session_name, display_name, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -254,6 +257,10 @@ const selectPeersByDirectory = db.prepare(`
 
 const selectPeersByGitRoot = db.prepare(`
   SELECT * FROM peers WHERE git_root = ?
+`);
+
+const selectPeerById = db.prepare(`
+  SELECT * FROM peers WHERE id = ?
 `);
 
 const insertMessage = db.prepare(`
@@ -301,6 +308,25 @@ function generateId(): string {
   return id;
 }
 
+// --- Auto-naming: sequential "Agent N" assignment with gap filling ---
+
+function nextAgentNumber(): number {
+  const rows = db.query(
+    "SELECT display_name FROM peers WHERE display_name LIKE 'Agent %'"
+  ).all() as { display_name: string }[];
+
+  const taken = new Set<number>();
+  for (const row of rows) {
+    const match = row.display_name.match(/^Agent (\d+)$/);
+    if (match?.[1]) taken.add(parseInt(match[1], 10));
+  }
+
+  // Fill gaps: find the lowest available number starting from 1
+  let n = 1;
+  while (taken.has(n)) n++;
+  return n;
+}
+
 // --- Request handlers ---
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
@@ -313,28 +339,43 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   // only one peer per terminal, preventing message theft by zombie processes.
   let sessionName = body.session_name ?? "";
   let summary = body.summary ?? "";
+  let inheritedDisplayName = "";
 
   // Evict by PID (same process re-registering)
-  const existingByPid = db.query("SELECT id, session_name, summary FROM peers WHERE pid = ?").get(body.pid) as { id: string; session_name: string; summary: string } | null;
+  const existingByPid = db.query("SELECT id, session_name, display_name, summary FROM peers WHERE pid = ?").get(body.pid) as { id: string; session_name: string; display_name: string; summary: string } | null;
   if (existingByPid) {
     if (!sessionName && existingByPid.session_name) sessionName = existingByPid.session_name;
+    if (existingByPid.display_name) inheritedDisplayName = existingByPid.display_name;
     if (!summary && existingByPid.summary) summary = existingByPid.summary;
     deletePeer.run(existingByPid.id);
   }
 
   // Evict by TTY (new process on same terminal — session was restarted)
   if (body.tty) {
-    const existingByTty = db.query("SELECT id, session_name, summary FROM peers WHERE tty = ? AND pid != ?").all(body.tty, body.pid) as Array<{ id: string; session_name: string; summary: string }>;
+    const existingByTty = db.query("SELECT id, session_name, display_name, summary FROM peers WHERE tty = ? AND pid != ?").all(body.tty, body.pid) as Array<{ id: string; session_name: string; display_name: string; summary: string }>;
     for (const stale of existingByTty) {
       if (!sessionName && stale.session_name) sessionName = stale.session_name;
+      if (!inheritedDisplayName && stale.display_name) inheritedDisplayName = stale.display_name;
       if (!summary && stale.summary) summary = stale.summary;
       brokerLog(`Evicting stale peer ${stale.id} (same TTY ${body.tty}, replaced by PID ${body.pid})`);
       deletePeer.run(stale.id);
     }
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, sessionName, summary, now, now);
-  return { id };
+  // Auto-assign sequential "Agent N" — immutable after registration
+  const displayName = inheritedDisplayName || `Agent ${nextAgentNumber()}`;
+  if (!sessionName) {
+    sessionName = displayName;
+  }
+
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, sessionName, displayName, summary, now, now);
+  brokerLog(`Registered peer ${id} as "${sessionName}" (display: ${displayName})`);
+  return { id, display_name: displayName };
+}
+
+function handleGetPeer(body: GetPeerRequest): GetPeerResponse {
+  const peer = selectPeerById.get(body.id) as Peer | null;
+  return { peer };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
@@ -405,6 +446,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
           git_root: rp.git_root,
           tty: null,
           session_name: rp.session_name,
+          display_name: rp.display_name || rp.session_name,
           summary: rp.summary,
           registered_at: rp.last_seen,
           last_seen: rp.last_seen,
@@ -610,9 +652,12 @@ Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // /health exempt — always respond (no auth required)
+    // Auth-exempt read-only endpoints
     if (path === "/health") {
       return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+    }
+    if (path === "/next-agent-number") {
+      return Response.json({ next: nextAgentNumber() });
     }
 
     // --- Auth check (before rate limiting and body parsing) ---
@@ -674,6 +719,8 @@ Bun.serve({
         case "/set-name":
           handleSetName(body as SetNameRequest);
           return Response.json({ ok: true });
+        case "/get-peer":
+          return Response.json(handleGetPeer(body as GetPeerRequest));
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
@@ -798,6 +845,7 @@ async function handleFederationConnect(body: FederationConnectRequest): Promise<
         cwd: p.cwd,
         git_root: p.git_root,
         session_name: p.session_name,
+        display_name: p.display_name || p.session_name,
         summary: p.summary,
         last_seen: p.last_seen,
       }));
@@ -931,6 +979,7 @@ async function syncRemotePeers(): Promise<void> {
         cwd: p.cwd,
         git_root: p.git_root,
         session_name: p.session_name,
+        display_name: p.display_name || p.session_name,
         summary: p.summary,
         last_seen: p.last_seen,
       }));

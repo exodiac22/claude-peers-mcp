@@ -40,9 +40,10 @@ tasks/                  # PRDs and project planning files
 | `list_peers(scope)` | Discover peers. Scope: machine/directory/repo/lan |
 | `send_message(to_id, text, type?, metadata?, reply_to?)` | Send message to peer. Remote peers use `hostname:peer_id` format |
 | `broadcast_message(message, scope)` | Send to all peers in scope (machine/directory/repo/lan) |
-| `set_name(name)` | Set session name (from /rename) |
+| `set_name(name)` | Override auto-assigned name (auto: "Agent 1", "Agent 2", etc.) |
 | `set_summary(summary)` | Set work summary visible to peers |
 | `check_messages()` | Diagnostic tool — without channel push, messages are auto-consumed by the MCP server before Claude sees them |
+| `whoami()` | Returns own peer ID, auto-assigned name, CWD, git root. No broker round-trip. |
 
 ## Running
 

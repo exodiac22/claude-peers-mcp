@@ -52,7 +52,7 @@ let authToken: string = "";
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BROKER_URL}${path}`, {
+  const makeRequest = () => fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -60,6 +60,41 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   });
+
+  let res: Response;
+  try {
+    res = await makeRequest();
+  } catch (networkErr) {
+    // Network error — broker may be dead. Attempt auto-restart once.
+    log(`brokerFetch network error on ${path}: ${networkErr instanceof Error ? networkErr.message : String(networkErr)}`);
+    if (brokerRestartInProgress) throw networkErr;
+    if (!(await isBrokerAlive())) {
+      brokerRestartInProgress = true;
+      try {
+        log("Broker appears dead, attempting restart...");
+        await ensureBroker();
+        authToken = readTokenSync();
+        // Re-register since restarted broker has fresh DB (skip if this IS the register call)
+        if (myRegistrationParams && path !== "/register") {
+          const reg = await brokerFetch<RegisterResponse>("/register", myRegistrationParams);
+          myId = reg.id;
+          myAutoName = reg.display_name ?? myAutoName;
+          log(`Re-registered as peer ${myId} (${myAutoName}) after broker restart`);
+        }
+        // Retry the original request
+        const retryRes = await makeRequest();
+        if (!retryRes.ok) {
+          const err = await retryRes.text();
+          throw new Error(`Broker error after restart (${path}): ${retryRes.status} ${err}`);
+        }
+        return retryRes.json() as Promise<T>;
+      } finally {
+        brokerRestartInProgress = false;
+      }
+    }
+    throw networkErr;
+  }
+
   // On 401, re-read token file and retry once (handles token rotation)
   if (res.status === 401) {
     try {
@@ -68,14 +103,7 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
       const err = await res.text();
       throw new Error(`Broker error (${path}): ${res.status} ${err}`);
     }
-    const retryRes = await fetch(`${BROKER_URL}${path}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${authToken}`,
-      },
-      body: JSON.stringify(body),
-    });
+    const retryRes = await makeRequest();
     if (!retryRes.ok) {
       const err = await retryRes.text();
       throw new Error(`Broker error (${path}): ${retryRes.status} ${err}`);
@@ -197,6 +225,11 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myAutoName: string = "";
+let myRegistrationParams: {
+  pid: number; cwd: string; git_root: string | null; tty: string | null; summary: string;
+} | null = null;
+let brokerRestartInProgress = false;
 // Track message IDs already pushed via channel to avoid re-pushing every poll cycle.
 // Messages are NOT acked by the poll loop — only check_messages acks them —
 // so they remain available as a fallback when channels aren't active.
@@ -222,10 +255,11 @@ Available tools:
 - send_message: Send a message to another instance by ID. Supports cross-machine messaging via LAN federation — remote peer IDs contain a colon (e.g., 'hostname:peer_id'). Supports optional type (text/query/response/handoff/broadcast), metadata (JSON object), and reply_to (message ID for threading).
 - broadcast_message: Send a message to all peers in a scope (machine/directory/repo). Useful for announcements, help requests, or coordination.
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- set_name: Set your session name (from /rename). Helps peers identify you by name instead of opaque ID.
+- set_name: Override your auto-assigned name (e.g., after /rename). Names are auto-assigned as "Agent 1", "Agent 2", etc. on startup.
 - check_messages: Manually check for new messages
+- whoami: Returns your own peer ID, auto-assigned name, working directory, and git root
 
-When you start or after using /rename, call set_name with your session name. This helps other instances identify you by name instead of opaque ID. Also call set_summary with [SESSION_NAME] prefix convention: '[MySession] description of work'.`,
+Your name is auto-assigned sequentially on startup (Agent 1, Agent 2, etc.). Use whoami to check your identity. Use set_name only to override it (e.g., after /rename). Use set_summary with your name as prefix: '[Agent 1] description of work'.`,
   }
 );
 
@@ -340,6 +374,15 @@ const TOOLS = [
       required: ["message", "scope"],
     },
   },
+  {
+    name: "whoami",
+    description:
+      "Returns your own identity: peer ID, auto-assigned name, working directory, and git root. Uses cached local state — no broker round-trip.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -374,12 +417,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.session_name) parts.unshift(`Name: ${p.session_name}`);
+          const parts: string[] = [];
+          if (p.session_name) {
+            parts.push(`Name: ${p.session_name} [${p.id}]`);
+          } else {
+            parts.push(`ID: ${p.id}`);
+          }
+          if (p.display_name && p.display_name !== p.session_name) {
+            parts.push(`Auto-name: ${p.display_name}`);
+          }
+          parts.push(`PID: ${p.pid}`);
+          parts.push(`CWD: ${p.cwd}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -654,6 +702,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "whoami": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: [
+            `Your identity:`,
+            `  ID: ${myId}`,
+            `  Name: ${myAutoName || "(none)"}`,
+            `  CWD: ${myCwd}`,
+            `  Git root: ${myGitRoot ?? "(none)"}`,
+          ].join("\n"),
+        }],
+      };
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -799,15 +868,17 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
+  myRegistrationParams = {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
-  });
+  };
+  const reg = await brokerFetch<RegisterResponse>("/register", myRegistrationParams);
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  myAutoName = reg.display_name ?? "";
+  log(`Registered as peer ${myId}${myAutoName ? ` (${myAutoName})` : ""}`);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {

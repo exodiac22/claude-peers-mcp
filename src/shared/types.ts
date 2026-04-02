@@ -11,9 +11,18 @@ export interface Peer {
   git_root: string | null;
   tty: string | null;
   session_name: string;
+  display_name: string;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+}
+
+export interface GetPeerRequest {
+  id: PeerId;
+}
+
+export interface GetPeerResponse {
+  peer: Peer | null;
 }
 
 export interface Message {
@@ -41,6 +50,7 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  display_name: string;
 }
 
 export interface HeartbeatRequest {
@@ -120,6 +130,7 @@ export interface RemotePeer {
   cwd: string;
   git_root: string | null;
   session_name: string;
+  display_name: string;
   summary: string;
   last_seen: string;    // ISO timestamp
 }
