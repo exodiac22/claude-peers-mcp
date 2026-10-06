@@ -68,7 +68,7 @@ Logs in `cpm-logs/` (gitignored): `messages.log`, `broker.log`, `server.log`, `f
 
 ## Bun
 
-Default to Bun, not Node.js.
+Default to Bun, not Node.js, with one exception: `src/server.ts` and `src/shared/` must also run under Node, because on Windows the MCP server is best launched with `node` (about 58 MB private memory per copy, against about 555 MB under Bun 1.3.10, measured 2026-10-06, one copy per Claude session). Use `node:*` modules there and never `Bun.*` globals. The broker and CLI stay on Bun.
 - `Bun.serve()` for HTTP, `bun:sqlite` for SQLite, `Bun.file` for file I/O
 - `bun test` for tests, `bun install` for deps
 - Bun auto-loads .env — don't use dotenv

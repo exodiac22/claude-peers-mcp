@@ -36,6 +36,12 @@ import {
 import { TOKEN_PATH, readTokenSync } from "./shared/token.ts";
 import { loadConfig } from "./shared/config.ts";
 import { fileURLToPath } from "url";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 // --- Configuration ---
 
@@ -148,11 +154,13 @@ async function ensureBroker(): Promise<void> {
     brokerEnv.CLAUDE_PEERS_FEDERATION_SUBNET = config.federation.subnet;
   }
 
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
+  // The broker stays on Bun (bun:sqlite, Bun.serve) whatever runtime runs this server.
+  // Detach so the broker survives if this MCP server exits
+  const proc = spawn("bun", [BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
     env: brokerEnv,
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
+    detached: true,
+    windowsHide: true,
   });
 
   // Unref so this process can exit without waiting for the broker
@@ -176,27 +184,21 @@ const MSG_LOG_PATH = `${CPM_LOG_DIR}/messages.log`;
 const SERVER_LOG_PATH = `${CPM_LOG_DIR}/server.log`;
 
 // Ensure log directory exists
-try { require("fs").mkdirSync(CPM_LOG_DIR, { recursive: true }); } catch {}
+try { mkdirSync(CPM_LOG_DIR, { recursive: true }); } catch {}
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
   const line = `[${new Date().toISOString()}] [CPM-server] ${msg}`;
   console.error(`[CPM-server] ${msg}`);
-  try { Bun.write(Bun.file(SERVER_LOG_PATH), line + "\n", { append: true }); } catch {}
+  // Overwrites, as before: Bun.write ignored its append option, so these log files
+  // have always held only the latest entry.
+  try { writeFileSync(SERVER_LOG_PATH, line + "\n"); } catch {}
 }
 
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
-    }
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd, windowsHide: true });
+    return stdout.trim();
   } catch {
     // not a git repo
   }
@@ -208,8 +210,8 @@ function getTty(): string | null {
     // Try to get the parent's tty from the process tree
     const ppid = process.ppid;
     if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
+      const proc = spawnSync("ps", ["-o", "tty=", "-p", String(ppid)], { windowsHide: true });
+      const tty = String(proc.stdout ?? "").trim();
       if (tty && tty !== "?" && tty !== "??") {
         return tty;
       }
@@ -512,7 +514,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         try {
           const logPath = MSG_LOG_PATH;
           const entry = `\n${"=".repeat(60)}\n[${timestamp}] SENT to ${to_id} (${msgIdTag}):\n${message}\n`;
-          await Bun.write(Bun.file(logPath), entry, { append: true });
+          writeFileSync(logPath, entry);
         } catch {
           // Non-critical
         }
@@ -682,7 +684,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         log(`--- BROADCAST SENT ---\n[${timestamp}] To ${result.recipients} peer(s) in scope '${scope}':\n${message}\n--- END BROADCAST ---`);
         try {
           const entry = `\n${"=".repeat(60)}\n[${timestamp}] BROADCAST to ${result.recipients} peer(s) in scope '${scope}':\n${message}\n`;
-          await Bun.write(Bun.file(MSG_LOG_PATH), entry, { append: true });
+          writeFileSync(MSG_LOG_PATH, entry);
         } catch {
           // Non-critical
         }
@@ -795,9 +797,9 @@ async function pollAndPushMessages() {
       log(`--- MESSAGE RECEIVED ---\n[${timestamp}] ${typeTag}From ${senderLabel} (${msg.from_id}):\n${bullets}${summaryLine}\n--- END MESSAGE ---`);
 
       try {
-        const logPath = `${process.env.HOME ?? require("os").homedir()}/.claude-peers-messages.log`;
+        const logPath = `${process.env.HOME ?? homedir()}/.claude-peers-messages.log`;
         const entry = `\n${"=".repeat(60)}\n${logEntry}\n`;
-        await Bun.write(Bun.file(logPath), entry, { append: true });
+        writeFileSync(logPath, entry);
       } catch {
         // Non-critical — file logging is best-effort
       }

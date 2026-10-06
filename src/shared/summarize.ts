@@ -5,6 +5,20 @@
  * Pure git-based — no external API calls, no dependencies.
  */
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+async function gitOutput(cwd: string, args: string[]): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", args, { cwd, windowsHide: true });
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
 export async function generateSummary(context: {
   cwd: string;
   git_root: string | null;
@@ -39,21 +53,8 @@ export async function generateSummary(context: {
  * Get the current git branch name for a directory.
  */
 export async function getGitBranch(cwd: string): Promise<string | null> {
-  try {
-    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
-    }
-  } catch {
-    // not a git repo
-  }
-  return null;
+  const text = await gitOutput(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  return text === null ? null : text.trim();
 }
 
 /**
@@ -65,13 +66,7 @@ export async function getRecentFiles(
 ): Promise<string[]> {
   try {
     // Get modified/staged files first
-    const diffProc = Bun.spawn(["git", "diff", "--name-only", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const diffText = await new Response(diffProc.stdout).text();
-    await diffProc.exited;
+    const diffText = (await gitOutput(cwd, ["diff", "--name-only", "HEAD"])) ?? "";
 
     const files = diffText
       .trim()
@@ -83,16 +78,7 @@ export async function getRecentFiles(
     }
 
     // Also get recently committed files
-    const logProc = Bun.spawn(
-      ["git", "log", "--oneline", "--name-only", "-5", "--format="],
-      {
-        cwd,
-        stdout: "pipe",
-        stderr: "ignore",
-      }
-    );
-    const logText = await new Response(logProc.stdout).text();
-    await logProc.exited;
+    const logText = (await gitOutput(cwd, ["log", "--oneline", "--name-only", "-5", "--format="])) ?? "";
 
     const logFiles = logText
       .trim()
