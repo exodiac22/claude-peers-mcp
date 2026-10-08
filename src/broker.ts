@@ -197,6 +197,7 @@ function isProcessAlive(pid: number): boolean {
         const result = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
           stdout: "pipe",
           stderr: "pipe",
+          windowsHide: true,
         });
         const output = new TextDecoder().decode(result.stdout);
         return output.includes(String(pid));
